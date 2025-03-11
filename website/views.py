@@ -13,6 +13,7 @@ import json
 from datetime import datetime
 import sendgrid
 from sendgrid.helpers.mail import Mail, Email, To, Content
+from dotenv import load_dotenv
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -25,9 +26,12 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
 # Ensure the upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
+# Load environment variables
+load_dotenv()
+
 # AWS S3 credentials
-AWS_ACCESS_KEY = 'AKIA3ZQKNITNKWK5UO3P'
-AWS_SECRET_KEY = '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'
+AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
+AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
 S3_BUCKET_NAME = 'zubair-folder'
 
 # SendGrid API key
