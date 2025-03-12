@@ -1,9 +1,11 @@
 from flask import Flask, request, render_template, redirect, url_for
+from dotenv import load_dotenv
 import os
 import boto3
+from botocore.exceptions import ClientError
 from botocore.exceptions import NoCredentialsError
 from werkzeug.utils import secure_filename
-import PyPDF2  # For PDF text extraction
+import docx
 import pdfplumber
 import re  # For parsing text
 import gspread
@@ -11,9 +13,13 @@ from oauth2client.service_account import ServiceAccountCredentials
 import requests
 import json
 from datetime import datetime
-import sendgrid
-from sendgrid.helpers.mail import Mail, Email, To, Content
-from dotenv import load_dotenv
+import time
+from datetime import datetime, timedelta, timezone
+import schedule
+from datetime import datetime, timedelta
+
+# Load environment variables from .env file
+load_dotenv()
 
 # Initialize Flask app
 app = Flask(__name__)
@@ -26,16 +32,12 @@ app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16 MB
 # Ensure the upload folder exists
 os.makedirs(app.config['UPLOAD_FOLDER'], exist_ok=True)
 
-# Load environment variables
-load_dotenv()
-
 # AWS S3 credentials
 AWS_ACCESS_KEY = os.getenv('AWS_ACCESS_KEY')
 AWS_SECRET_KEY = os.getenv('AWS_SECRET_KEY')
-S3_BUCKET_NAME = 'zubair-folder'
-
-# SendGrid API key
-SENDGRID_API_KEY = 'sendgrid-api-key'
+AWS_REGION = os.getenv('AWS_REGION')
+SENDER_EMAIL = os.getenv('SENDER_EMAIL')
+S3_BUCKET_NAME = os.getenv('S3_BUCKET_NAME')
 
 # Helper function to check file extensions
 def allowed_file(filename):
@@ -46,7 +48,7 @@ def allowed_file(filename):
 def upload_to_s3(file_path, bucket_name, object_name):
     s3 = boto3.client('s3', aws_access_key_id=AWS_ACCESS_KEY, aws_secret_access_key=AWS_SECRET_KEY)
     try:
-        s3.upload_file(file_path, bucket_name, object_name)
+        s3.upload_file(file_path, bucket_name, object_name, ExtraArgs={'ACL': 'public-read'})
         print(f"Upload successful: {object_name}")
         return f"https://{bucket_name}.s3.amazonaws.com/{object_name}"
     except FileNotFoundError:
@@ -56,6 +58,14 @@ def upload_to_s3(file_path, bucket_name, object_name):
         print("Credentials not available.")
         return None
 
+def extract_text_from_file(file_path, file_extension):
+    if file_extension == 'pdf':
+        return extract_text_from_pdf(file_path)
+    elif file_extension == 'docx':
+        return extract_text_from_docx(file_path)
+    else:
+        raise ValueError("Unsupported file format")
+
 # Function to extract text from PDF
 def extract_text_from_pdf(pdf_path):
     text = ""
@@ -64,66 +74,166 @@ def extract_text_from_pdf(pdf_path):
             text += page.extract_text() or ''
     return text
 
+def extract_text_from_docx(file_path):
+    doc = docx.Document(file_path)
+    text = ""
+    for paragraph in doc.paragraphs:
+        text += paragraph.text + "\n"
+    return text
+
+def extract_resume_sections(text):
+    """
+    Extract multiple sections from a resume text using a more robust approach.
+    Returns a dictionary with each section's content.
+    """
+    # Common section headers in resumes
+    section_headers = {
+        "education": ["education", "academic background", "degrees", "academic history"],
+        "qualifications": ["skills", "qualifications", "technical skills", "certifications", "expertise"],
+        "experience": ["projects", "experience", "work experience", "employment history", "internship"],
+        "contact": ["contact", "personal information", "contact details"],
+        "summary": ["summary", "professional summary", "profile", "objective"]
+    }
+
+    # Convert text to lowercase for case-insensitive matching
+    text_lower = text.lower()
+    lines = text.split('\n')
+
+    # Find the starting indices of each section
+    section_indices = {}
+    for i, line in enumerate(lines):
+        line_lower = line.lower()
+        for section, keywords in section_headers.items():
+            # Use regex to match whole words only
+            for keyword in keywords:
+                if re.search(r'\b' + re.escape(keyword) + r'\b', line_lower):
+                    section_indices[section] = i
+                    break
+
+    # Sort sections by their position in the text
+    sorted_sections = sorted(section_indices.items(), key=lambda x: x[1])
+
+    # Extract content for each section
+    results = {}
+    for i, (section, start_idx) in enumerate(sorted_sections):
+        # Determine end index (start of next section or end of text)
+        end_idx = len(lines)
+        if i < len(sorted_sections) - 1:
+            end_idx = sorted_sections[i + 1][1]
+
+        # Extract content (skip the header line)
+        content = lines[start_idx + 1:end_idx]
+        # Remove leading/trailing empty lines
+        while content and content[0].strip() == "":
+            content.pop(0)
+        while content and content[-1].strip() == "":
+            content.pop()
+
+        results[section] = content
+
+    return results
+
+def extract_education(text):
+    """Extract education section from resume text."""
+    sections = extract_resume_sections(text)
+    return sections.get("education", [])
+
+def extract_qualifications(text):
+    """Extract qualifications section from resume text."""
+    sections = extract_resume_sections(text)
+    return sections.get("qualifications", [])
+
+def extract_projects(text):
+    """Extract projects/experience section from resume text."""
+    sections = extract_resume_sections(text)
+    return sections.get("experience", [])
+
+def extract_contact_info(text):
+    """Extract contact information section from resume text."""
+    sections = extract_resume_sections(text)
+    return sections.get("contact", [])
+
 def extract_personal_info(text):
-    # Extract name, email, and phone number
+    # First try to find structured info with regex
+    email = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)
+    phone = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4})', text)
     name = re.search(r"Name:\s*(.*)", text, re.IGNORECASE)
-    email = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', text)  # Matches email
-    phone = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4})', text)  # Matches phone numbers
+
+    # Try to get more info from the contact section if it exists
+    contact_section = extract_contact_info(text)
+    contact_text = "\n".join(contact_section)
+
+    # If no email found yet, try in contact section
+    if not email and contact_section:
+        email = re.search(r'[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}', contact_text)
+
+    # If no phone found yet, try in contact section
+    if not phone and contact_section:
+        phone = re.search(r'(\+?\d{1,3}[-.\s]?\(?\d{1,4}\)?[-.\s]?\d{1,4}[-.\s]?\d{1,4})', contact_text)
+
+    # If still no name, try to find it at the beginning of the document
+    if not name:
+        # Often the name is at the very top of the resume
+        first_lines = text.split('\n')[:3]  # Check first 3 lines
+        for line in first_lines:
+            if line.strip() and not re.search(r'@|www|\d{3}', line):  # Avoid lines with emails, websites, or phone numbers
+                name = line.strip()
+                break
 
     personal_info = {
-        "name": name.group(0) if name else None,
+        "name": name.group(1) if hasattr(name, 'group') else name,
         "email": email.group(0) if email else None,
         "phone": phone.group(0) if phone else None
     }
     return personal_info
 
 # Function to send follow-up email
-def send_follow_up_email(applicant_email):
-    sg = sendgrid.SendGridAPIClient(api_key=SENDGRID_API_KEY)
-    from_email = Email("zubairmohideen95@gmail.com")
-    to_email = To(applicant_email)  # Applicant's email
+def send_follow_up_email(applicant_email, time_zone):
+    ses_client = boto3.client('ses',
+                              region_name=AWS_REGION,
+                              aws_access_key_id=AWS_ACCESS_KEY,
+                              aws_secret_access_key=AWS_SECRET_KEY)
+
     subject = "Your CV is under review"
-    content = Content("text/plain", "Thank you for submitting your CV. It is currently under review.")
-    mail = Mail(from_email, to_email, subject, content)
+    body_text = "Thank you for submitting your CV. It is currently under review."
 
     try:
-        response = sg.client.mail.send.post(request_body=mail.get())
-        print(f"Email sent to {applicant_email}. Status code: {response.status_code}")
-    except Exception as e:
-        print(f"Failed to send email: {e}")
+        response = ses_client.send_email(
+            Destination={
+                'ToAddresses': [
+                    applicant_email,
+                ],
+            },
+            Message={
+                'Body': {
+                    'Text': {
+                        'Charset': 'UTF-8',
+                        'Data': body_text,
+                    },
+                },
+                'Subject': {
+                    'Charset': 'UTF-8',
+                    'Data': subject,
+                },
+            },
+            Source=SENDER_EMAIL,
+        )
+        print(f"Email sent to {applicant_email}. Message ID: {response['MessageId']}")
+    except ClientError as e:
+        print(f"Failed to send email: {e.response['Error']['Message']}")
 
-def extract_education(text):
-    # Look for keywords like "Education", "Degree", "University", etc.
-    education_keywords = ["education", "degree", "university", "college", "school"]
-    sentences = text.split('\n')  # Split text into lines
-    education_section = []
+def schedule_follow_up(applicant_email):
+    # Set the fixed UTC time for the email (e.g., 10:00 AM UTC)
+    target_utc_time = datetime.now(timezone.utc).replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
-    for sentence in sentences:
-        if any(keyword in sentence.lower() for keyword in education_keywords):
-            education_section.append(sentence.strip())
-    return education_section
+    # Calculate the delay until the target time
+    delay_seconds = (target_utc_time - datetime.now(timezone.utc)).total_seconds()
 
-def extract_qualifications(text):
-    # Look for keywords like "Skills", "Qualifications", "Certifications", etc.
-    qualifications_keywords = ["skills", "qualifications", "certifications", "technical skills"]
-    sentences = text.split('\n')
-    qualifications_section = []
-
-    for sentence in sentences:
-        if any(keyword in sentence.lower() for keyword in qualifications_keywords):
-            qualifications_section.append(sentence.strip())
-    return qualifications_section
-
-def extract_projects(text):
-    # Look for keywords like "Projects", "Experience", "Work", etc.
-    projects_keywords = ["projects", "experience", "work", "internship"]
-    sentences = text.split('\n')
-    projects_section = []
-
-    for sentence in sentences:
-        if any(keyword in sentence.lower() for keyword in projects_keywords):
-            projects_section.append(sentence.strip())
-    return projects_section
+    if delay_seconds > 0:
+        schedule.every(delay_seconds).seconds.do(send_follow_up_email, applicant_email)
+        print(f"Email scheduled for {applicant_email} at {target_utc_time} UTC.")
+    else:
+        print("Scheduled time has already passed.")
 
 
 def save_to_google_sheets(data):
@@ -140,7 +250,7 @@ def save_to_google_sheets(data):
         print("Available Sheets:", [ws.title for ws in worksheets])
 
             # Make sure you're using the correct sheet name
-        sheet = spreadsheet.sheet1  # OR use: sheet = spreadsheet.worksheet("YourSheetName")
+        sheet = spreadsheet.sheet1
 
             # Debug: Check the data before appending
         print("Data being sent to Google Sheets:", data)
@@ -151,6 +261,20 @@ def save_to_google_sheets(data):
         print("Row added successfully!")
     except Exception as e:
         print(f"Error while adding row to Google Sheets: {e}")
+
+# Function to send webhook
+def send_webhook(payload, candidate_email):
+    url = "https://rnd-assignment.automations-3d6.workers.dev/"
+    headers = {
+        "X-Candidate-Email": candidate_email,
+        "Content-Type": "application/json"
+    }
+    try:
+        response = requests.post(url, headers=headers, data=json.dumps(payload))
+        response.raise_for_status()  # Raise an exception for HTTP errors
+        print(f"Webhook response: {response.status_code}, {response.text}")
+    except requests.exceptions.RequestException as e:
+        print(f"Webhook request failed: {e}")
 
 # Route for the form
 @app.route('/', methods=['GET', 'POST'])
@@ -166,6 +290,7 @@ def submit_form():
         if cv and allowed_file(cv.filename):
             # Secure the filename and save it temporarily
             filename = secure_filename(cv.filename)
+            file_extension = filename.rsplit('.', 1)[1].lower()  # Get file extension
             cv_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
             cv.save(cv_path)
 
@@ -174,7 +299,7 @@ def submit_form():
             if cv_public_link:
                 print(f"CV uploaded successfully. Public link: {cv_public_link}")
                 # Extract text from the CV
-                cv_text = extract_text_from_pdf(cv_path)
+                cv_text = extract_text_from_file(cv_path, file_extension)
                 # print(f"Extracted text: {cv_text}")
 
                 # Extract specific sections
@@ -214,23 +339,18 @@ def submit_form():
                     "metadata": {
                         "applicant_name": name,
                         "email": email,
-                        "status": "testing",  # Change to "prod" for final submission
+                        "status": "test",
                         "cv_processed": True,
                         "processed_timestamp": datetime.utcnow().isoformat() + "Z"
                     }
                 }
 
                 # Send the HTTP request (webhook)
-                url = "https://rnd-assignment.automations-3d6.workers.dev/"
-                headers = {
-                    "X-Candidate-Email": "zubairmohideen95@gmail.com",
-                    "Content-Type": "application/json"
-                }
-                response = requests.post(url, headers=headers, data=json.dumps(payload))
-                print(f"Webhook response: {response.status_code}, {response.text}")
+                candidate_email = "zubairmohideen95@gmail.com"
+                send_webhook(payload, candidate_email)
 
-                # Send follow-up email
-                send_follow_up_email(email)  # Use the applicant's email from the form
+                 # Schedule follow-up email for the actual applicant
+                schedule_follow_up(email)  # Use the applicant's email
 
                 return redirect(url_for('success'))  # Redirect to success page
             else:
@@ -242,7 +362,7 @@ def submit_form():
 
 @app.route('/success')
 def success():
-    return 'Form submitted successfully!'
+    return render_template('success.html')
 
 if __name__ == '__main__':
     app.run(debug=True)
