@@ -223,7 +223,7 @@ def send_follow_up_email(applicant_email, time_zone):
         print(f"Failed to send email: {e.response['Error']['Message']}")
 
 def schedule_follow_up(applicant_email):
-    # Set the fixed UTC time for the email (e.g., 10:00 AM UTC)
+    # Set the fixed time for the email (e.g., 10:00 AM )
     target_utc_time = datetime.now(timezone.utc).replace(hour=10, minute=0, second=0, microsecond=0) + timedelta(days=1)
 
     # Calculate the delay until the target time
@@ -238,8 +238,11 @@ def schedule_follow_up(applicant_email):
 
 def save_to_google_sheets(data):
     try:
+        # Get the JSON string directly from .env
+        credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
+
         scope = ["https://www.googleapis.com/auth/spreadsheets"]
-        creds = ServiceAccountCredentials.from_json_keyfile_name('credentials.json', scope)
+        creds = ServiceAccountCredentials.from_json_keyfile_dict(json.loads(credentials_json), scope)
         client = gspread.authorize(creds)
 
         sheet_id = "1L_tHvB5PTru_d8CWyr3dDlsGvYNPXbMn9PsU1qv5m00"
@@ -249,14 +252,13 @@ def save_to_google_sheets(data):
         worksheets = spreadsheet.worksheets()
         print("Available Sheets:", [ws.title for ws in worksheets])
 
-            # Make sure you're using the correct sheet name
         sheet = spreadsheet.sheet1
 
-            # Debug: Check the data before appending
+        # Debug: Check the data before appending
         print("Data being sent to Google Sheets:", data)
         print("Type of data:", type(data))
 
-            # Append row
+        # Append row
         sheet.append_row(data)
         print("Row added successfully!")
     except Exception as e:
@@ -339,7 +341,7 @@ def submit_form():
                     "metadata": {
                         "applicant_name": name,
                         "email": email,
-                        "status": "test",
+                        "status": "prod",
                         "cv_processed": True,
                         "processed_timestamp": datetime.utcnow().isoformat() + "Z"
                     }
